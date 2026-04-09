@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ルート録音ツール（実走ルート＋停止候補）</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="anonymous">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin="anonymous"></script>
+
+<style>
+  html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Meiryo,sans-serif;background:#fafafa}
+  #map{height:58vh}
+  .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;background:#fff;border-bottom:1px solid #e5e7eb}
+  .mono{font-family:ui-monospace,Consolas,Menlo,monospace}
+  button{padding:8px 12px;cursor:pointer;border:1px solid #cbd5e1;background:#fff;border-radius:8px}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  input[type=number],input[type=text],textarea,select{padding:6px 8px;border:1px solid #cbd5e1;border-radius:8px;background:#fff}
+  input[type=number]{width:6.8em}
+  textarea{width:100%;min-height:72px;resize:vertical}
+  .stat{padding:6px 10px}
+  .warn{color:#b00}
+  .ok{color:#0a6}
+  .small{font-size:12px;color:#555}
+  .panel{padding:10px;background:#fff;border-top:1px solid #e5e7eb}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
+  .popup-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+  .chip{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef2ff;font-size:12px;margin-right:6px}
+</style>
+</head>
+<body>
+<div class="bar">
+  精度≦<input id="maxAcc" type="number" value="25" min="1" step="1"> m
+  最小移動≧<input id="minDist" type="number" value="5" min="0" step="1"> m
+  停止速度≦<input id="stopSpeedKmh" type="number" value="1.2" min="0" step="0.1"> km/h
+  停止秒数≧<input id="stopDurationSec" type="number" value="10" min="3" step="1"> 秒
+  まとまり半径≦<input id="stopRadius" type="number" value="10" min="3" step="1"> m
+  候補間隔≧<input id="cooldownSec" type="number" value="45" min="0" step="1"> 秒
+</div>
+
+<div class="bar">
+  <button id="btnStart">記録開始</button>
+  <button id="btnPause" disabled>一時停止</button>
+  <button id="btnStop" disabled>記録停止</button>
+  <button id="btnWake" title="画面スリープ防止のON/OFF">スリープ防止OFF</button>
+  <label><input id="autoCandidate" type="checkbox" checked> 停止候補を自動検出</label>
+  <span id="status" class="mono"></span>
+</div>
+
+<div id="map" aria-label="地図"></div>
+
+<div class="bar">
+  <button id="saveGeoJSON" disabled>GeoJSON保存</button>
+  <button id="saveGPX" disabled>GPX保存</button>
+  <button id="saveCSV" disabled>停止候補CSV保存</button>
+  <button id="saveGeoJSONWithStops" disabled>GeoJSON(線+点)保存</button>
+  <button id="btnClear" disabled>クリア</button>
+  <span class="stat mono" id="stats">pts:0 | dist:0 m | avg:0 km/h | cur:0 km/h | acc:– m | stops:0</span>
+</div>
+
+<div class="panel">
+  <div class="grid">
+    <div>
+      <div><strong>使い方</strong></div>
+      <div class="small">配達中は基本ノータッチ。停止候補は自動検出されます。候補ピンを押すと、確定・削除・特記事項入力ができます。</div>
+    </div>
+    <div>
+      <div><strong>候補の意味</strong></div>
+      <div class="small"><span class="chip">候補</span>自動検出された停止地点 / <span class="chip">確定</span>後で残すと決めた地点</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id)=>document.getElementById(id);
+
+// ---- 地図 ----
+const map = L.map('map').setView([35.0,135.86], 14);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+  maxZoom:19,
+  attribution:'&copy; OpenStreetMap'
+}).addTo(map);
+
+const routeLine = L.polyline([], {color:'#0aa', weight:5}).addTo(map);
+const curMarker = L.circleMarker([35.0,135.86], {radius:6, color:'#07a', fillColor:'#07a', fillOpacity:1}).addTo(map);
+let accCircle = L.circle([35.0,135.86], {radius:0, color:'#999', weight:1, fillOpacity:0.05}).addTo(map);
+const stopsLayer = L.layerGroup().addTo(map);
+
+// ---- 記録データ ----
+let watchId = null;
+let points = []; // {lat,lng,time,acc,speedKmh?}
+let distance = 0;
+let startTime = null;
+let lastPoint = null;
+let paused = false;
+let wakeLock = null;
+let stopCandidates = []; // {id,lat,lng,timeEnd,durationSec,confirmed,note,deleted,source}
+let stopIdSeq = 1;
+let candidateState = null; // {startAt,lastAt,points:[]}
+let lastCandidateTime = 0;
+
+// ---- ユーティリティ ----
+const rad = x=>x*Math.PI/180;
+function haversine(a,b){
+  const R=6371000, dLat=rad(b.lat-a.lat), dLng=rad(b.lng-a.lng);
+  const s1=Math.sin(dLat/2), s2=Math.sin(dLng/2);
+  const aa=s1*s1 + Math.cos(rad(a.lat))*Math.cos(rad(b.lat))*s2*s2;
+  return 2*R*Math.asin(Math.min(1,Math.sqrt(aa)));
+}
+function fmtKmh(v){ return Number(v||0).toFixed(1); }
+function fmtDt(iso){
+  if(!iso) return '';
+  const d = new Date(iso);
+  const pad=n=>String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function esc(s){
+  return String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+function setStatus(s, warn=false, ok=false){
+  $('#status').textContent = s || '';
+  $('#status').className = 'mono' + (warn ? ' warn' : '') + (ok ? ' ok' : '');
+}
+function updateStats(curSpeedKmh, acc){
+  const elapsed = startTime ? (Date.now()-startTime)/1000 : 0;
+  const avgMps = elapsed>0 ? (distance/elapsed) : 0;
+  const activeStops = stopCandidates.filter(s=>!s.deleted).length;
+  $('#stats').textContent = `pts:${points.length} | dist:${distance.toFixed(0)} m | avg:${fmtKmh(avgMps*3.6)} km/h | cur:${fmtKmh(curSpeedKmh||0)} km/h | acc:${acc?.toFixed?.(0)??'–'} m | stops:${activeStops}`;
+  const hasRoute = points.length > 0;
+  const hasStops = activeStops > 0;
+  $('#saveGeoJSON').disabled = !hasRoute;
+  $('#saveGPX').disabled = !hasRoute;
+  $('#saveCSV').disabled = !hasStops;
+  $('#saveGeoJSONWithStops').disabled = !hasRoute && !hasStops;
+  $('#btnClear').disabled = !(hasRoute || hasStops);
+}
+function averageLatLng(arr){
+  const sum = arr.reduce((acc,p)=>({lat:acc.lat+p.lat,lng:acc.lng+p.lng}), {lat:0,lng:0});
+  return {lat:sum.lat/arr.length, lng:sum.lng/arr.length};
+}
+function fileTimestamp(){
+  const d = new Date();
+  const pad=n=>String(n).padStart(2,'0');
+  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+async function toggleWakeLock(){
+  try{
+    if (!('wakeLock' in navigator)) { setStatus('Wake Lock未対応（電源設定に注意）', true); return; }
+    if (wakeLock) {
+      await wakeLock.release();
+      wakeLock = null;
+      $('#btnWake').textContent='スリープ防止OFF';
+      return;
+    }
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', ()=>{
+      $('#btnWake').textContent='スリープ防止OFF';
+      wakeLock = null;
+    });
+    $('#btnWake').textContent='スリープ防止ON';
+  }catch(e){
+    setStatus('スリープ防止に失敗: ' + e.message, true);
+  }
+}
+
+// ---- 停止候補 ----
+function resetStopState(){
+  candidateState = null;
+}
+function commitStopCandidate(reason='auto'){
+  if (!candidateState || candidateState.points.length === 0) return;
+  const minDurationSec = Number($('#stopDurationSec').value)||10;
+  const durationSec = (candidateState.lastAt - candidateState.startAt) / 1000;
+  if (durationSec < minDurationSec) {
+    candidateState = null;
+    return;
+  }
+  const coolMs = (Number($('#cooldownSec').value)||45) * 1000;
+  if (candidateState.lastAt - lastCandidateTime < coolMs) {
+    candidateState = null;
+    return;
+  }
+
+  const center = averageLatLng(candidateState.points);
+  const item = {
+    id: stopIdSeq++,
+    lat: Number(center.lat.toFixed(7)),
+    lng: Number(center.lng.toFixed(7)),
+    timeStart: new Date(candidateState.startAt).toISOString(),
+    timeEnd: new Date(candidateState.lastAt).toISOString(),
+    durationSec: Math.round(durationSec),
+    confirmed: false,
+    note: '',
+    deleted: false,
+    source: reason
+  };
+  stopCandidates.push(item);
+  lastCandidateTime = candidateState.lastAt;
+  candidateState = null;
+  renderStopMarkers();
+  updateStats(points.at(-1)?.speedKmh || 0, points.at(-1)?.acc || null);
+  setStatus(`停止候補を追加しました（${item.durationSec}秒）`, false, true);
+}
+function updateStopDetection(cur, speedKmh, nowMs){
+  if (!$('#autoCandidate').checked) {
+    resetStopState();
+    return;
+  }
+  const stopSpeedKmh = Number($('#stopSpeedKmh').value)||1.2;
+  const stopRadius = Number($('#stopRadius').value)||10;
+
+  if (speedKmh <= stopSpeedKmh) {
+    if (!candidateState) {
+      candidateState = {startAt: nowMs, lastAt: nowMs, points:[cur]};
+      return;
+    }
+    const center = averageLatLng(candidateState.points);
+    const drift = haversine(center, cur);
+    if (drift <= stopRadius) {
+      candidateState.points.push(cur);
+      candidateState.lastAt = nowMs;
+    } else {
+      commitStopCandidate('auto');
+      candidateState = {startAt: nowMs, lastAt: nowMs, points:[cur]};
+    }
+  } else {
+    commitStopCandidate('auto');
+  }
+}
+function renderStopMarkers(){
+  stopsLayer.clearLayers();
+  stopCandidates.filter(s=>!s.deleted).forEach(item=>{
+    const color = item.confirmed ? '#0a6' : '#d97706';
+    const marker = L.circleMarker([item.lat, item.lng], {
+      radius: 8,
+      color,
+      fillColor: color,
+      fillOpacity: 0.9,
+      weight: 2
+    }).addTo(stopsLayer);
+
+    const popupHtml = `
+      <div style="min-width:260px">
+        <div><strong>${item.confirmed ? '確定ポイント' : '停止候補'}</strong></div>
+        <div class="small">ID: ${item.id}</div>
+        <div class="small">終了時刻: ${esc(fmtDt(item.timeEnd))}</div>
+        <div class="small">滞在: ${item.durationSec} 秒</div>
+        <div class="small">座標: ${item.lat}, ${item.lng}</div>
+        <div style="margin-top:8px">
+          <label class="small">特記事項</label>
+          <textarea id="note_${item.id}" placeholder="例: 玄関は裏 / ポストは右 / 朝刊のみ">${esc(item.note)}</textarea>
+        </div>
+        <div class="popup-actions">
+          <button onclick="window.__saveStopNote(${item.id})">メモ保存</button>
+          <button onclick="window.__toggleConfirm(${item.id})">${item.confirmed ? '未確定に戻す' : '確定にする'}</button>
+          <button onclick="window.__deleteStop(${item.id})">削除</button>
+        </div>
+      </div>
+    `;
+    marker.bindPopup(popupHtml);
+  });
+}
+window.__saveStopNote = function(id){
+  const item = stopCandidates.find(s=>s.id===id);
+  const el = document.getElementById(`note_${id}`);
+  if(!item || !el) return;
+  item.note = el.value.trim();
+  setStatus(`ID ${id} のメモを保存しました`, false, true);
+  renderStopMarkers();
+};
+window.__toggleConfirm = function(id){
+  const item = stopCandidates.find(s=>s.id===id);
+  if(!item) return;
+  item.confirmed = !item.confirmed;
+  renderStopMarkers();
+  setStatus(`ID ${id} を${item.confirmed ? '確定' : '未確定'}にしました`, false, true);
+};
+window.__deleteStop = function(id){
+  const item = stopCandidates.find(s=>s.id===id);
+  if(!item) return;
+  item.deleted = true;
+  renderStopMarkers();
+  updateStats(points.at(-1)?.speedKmh || 0, points.at(-1)?.acc || null);
+  setStatus(`ID ${id} を削除しました`, false, true);
+};
+
+// ---- 位置受信 ----
+function onPos(pos){
+  if (paused) return;
+  const {latitude:lat, longitude:lng, accuracy} = pos.coords;
+  const t = Date.now();
+  const maxAcc = Number($('#maxAcc').value)||25;
+  const minDist = Number($('#minDist').value)||0;
+
+  if (accuracy && accuracy > maxAcc) {
+    setStatus(`精度${accuracy.toFixed(0)}m > 閾値${maxAcc}m: スキップ`);
+    updateStats(0, accuracy);
+    return;
+  }
+
+  const cur = {lat, lng};
+
+  // 表示は常に更新
+  curMarker.setLatLng([lat,lng]);
+  accCircle.setLatLng([lat,lng]).setRadius(accuracy||0);
+
+  let moved = 0;
+  if (lastPoint) moved = haversine(lastPoint, cur);
+
+  if (lastPoint && moved < minDist) {
+    const dtSec = Math.max(1, (t - new Date(points.at(-1)?.time || t).getTime())/1000);
+    const curSpeedKmh = (moved / dtSec) * 3.6;
+    updateStopDetection(cur, curSpeedKmh, t);
+    map.panTo([lat,lng], {animate:false});
+    setStatus(`移動${moved.toFixed(1)}m < 閾値${minDist}m: 線はスキップ`);
+    updateStats(curSpeedKmh, accuracy);
+    return;
+  }
+
+  if (lastPoint) {
+    distance += moved;
+  } else {
+    startTime = t;
+    distance = 0;
+  }
+
+  let curSpeedKmh = 0;
+  if (lastPoint) {
+    const prevT = new Date(points.at(-1)?.time || t).getTime();
+    const dtSec = Math.max(1, (t - prevT)/1000);
+    curSpeedKmh = (moved / dtSec) * 3.6;
+  }
+
+  lastPoint = cur;
+  points.push({lat,lng,time:new Date(t).toISOString(),acc:accuracy||null,speedKmh:Number(curSpeedKmh.toFixed(2))});
+
+  routeLine.addLatLng([lat,lng]);
+  if (points.length===1) map.setView([lat,lng], 16, {animate:false});
+  else map.panTo([lat,lng], {animate:false});
+
+  updateStopDetection(cur, curSpeedKmh, t);
+  updateStats(curSpeedKmh, accuracy);
+}
+function onPosErr(err){
+  setStatus(`位置取得エラー: ${err.message}`, true);
+}
+
+// ---- 記録制御 ----
+function start(){
+  if (watchId) navigator.geolocation.clearWatch(watchId);
+  paused = false;
+  resetStopState();
+  setStatus('記録中…（ブラウザを前面に保つと安定）');
+  watchId = navigator.geolocation.watchPosition(onPos, onPosErr, {
+    enableHighAccuracy: true,
+    maximumAge: 0,
+    timeout: 20000
+  });
+  $('#btnStart').disabled = true;
+  $('#btnPause').disabled = false;
+  $('#btnStop').disabled  = false;
+}
+function pause(){
+  paused = !paused;
+  if (paused) commitStopCandidate('pause');
+  $('#btnPause').textContent = paused ? '再開' : '一時停止';
+  setStatus(paused ? '一時停止中' : '記録中…');
+}
+function stop(){
+  if (watchId){ navigator.geolocation.clearWatch(watchId); watchId=null; }
+  paused = false;
+  commitStopCandidate('stop');
+  resetStopState();
+  $('#btnStart').disabled = false;
+  $('#btnPause').disabled = true;
+  $('#btnPause').textContent='一時停止';
+  $('#btnStop').disabled  = true;
+  updateStats(points.at(-1)?.speedKmh || 0, points.at(-1)?.acc || null);
+  setStatus('停止しました。保存ボタンで書き出せます。', false, true);
+}
+function clearAll(){
+  if (watchId){ navigator.geolocation.clearWatch(watchId); watchId=null; }
+  points = [];
+  distance = 0;
+  startTime = null;
+  lastPoint = null;
+  paused = false;
+  stopCandidates = [];
+  stopIdSeq = 1;
+  candidateState = null;
+  lastCandidateTime = 0;
+  routeLine.setLatLngs([]);
+  stopsLayer.clearLayers();
+  curMarker.setLatLng([35.0,135.86]);
+  accCircle.setLatLng([35.0,135.86]).setRadius(0);
+  $('#btnStart').disabled = false;
+  $('#btnPause').disabled = true;
+  $('#btnPause').textContent = '一時停止';
+  $('#btnStop').disabled = true;
+  updateStats(0, null);
+  setStatus('クリアしました。');
+}
+
+// ---- 保存 ----
+function download(name, text, type='application/octet-stream'){
+  const blob = new Blob([text], {type});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+function routeFeature(){
+  return {
+    type:'Feature',
+    properties:{
+      name:'recorded-route',
+      start_time: points[0]?.time || null,
+      end_time: points.at(-1)?.time || null,
+      point_count: points.length,
+      distance_m: Number(distance.toFixed(1))
+    },
+    geometry:{
+      type:'LineString',
+      coordinates: points.map(p=>[p.lng, p.lat])
+    }
+  };
+}
+function stopFeatures(){
+  return stopCandidates.filter(s=>!s.deleted).map(s=>(
+    {
+      type:'Feature',
+      properties:{
+        id:s.id,
+        confirmed:s.confirmed,
+        note:s.note,
+        time_start:s.timeStart,
+        time_end:s.timeEnd,
+        duration_sec:s.durationSec,
+        source:s.source
+      },
+      geometry:{type:'Point', coordinates:[s.lng, s.lat]}
+    }
+  ));
+}
+function saveGeoJSON(){
+  const gj = {type:'FeatureCollection', features:[routeFeature()]};
+  download(`route_${fileTimestamp()}.geojson`, JSON.stringify(gj, null, 2), 'application/geo+json;charset=utf-8');
+}
+function saveGeoJSONWithStops(){
+  const features = [];
+  if (points.length) features.push(routeFeature());
+  features.push(...stopFeatures());
+  const gj = {type:'FeatureCollection', features};
+  download(`route_and_stops_${fileTimestamp()}.geojson`, JSON.stringify(gj, null, 2), 'application/geo+json;charset=utf-8');
+}
+function saveGPX(){
+  const trkpts = points.map(p => `    <trkpt lat="${p.lat}" lon="${p.lng}"><time>${p.time}</time></trkpt>`).join('\n');
+  const gpx = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="ChatGPT" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>recorded-route</name>
+    <trkseg>
+${trkpts}
+    </trkseg>
+  </trk>
+</gpx>`;
+  download(`route_${fileTimestamp()}.gpx`, gpx, 'application/gpx+xml;charset=utf-8');
+}
+function csvEscape(v){
+  const s = String(v ?? '');
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+}
+function saveCSV(){
+  const header = ['id','lat','lng','time_start','time_end','duration_sec','confirmed','source','note'];
+  const rows = stopCandidates.filter(s=>!s.deleted).map(s => [
+    s.id, s.lat, s.lng, s.timeStart, s.timeEnd, s.durationSec, s.confirmed, s.source, s.note
+  ]);
+  const csv = [header, ...rows].map(r => r.map(csvEscape).join(',')).join('\n');
+  download(`stops_${fileTimestamp()}.csv`, csv, 'text/csv;charset=utf-8');
+}
+
+// ---- イベント ----
+$('#btnStart').addEventListener('click', start);
+$('#btnPause').addEventListener('click', pause);
+$('#btnStop').addEventListener('click', stop);
+$('#btnWake').addEventListener('click', toggleWakeLock);
+$('#btnClear').addEventListener('click', clearAll);
+$('#saveGeoJSON').addEventListener('click', saveGeoJSON);
+$('#saveGPX').addEventListener('click', saveGPX);
+$('#saveCSV').addEventListener('click', saveCSV);
+$('#saveGeoJSONWithStops').addEventListener('click', saveGeoJSONWithStops);
+updateStats(0, null);
+</script>
+</body>
+</html>
