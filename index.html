@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ルート記録ツール（実走ルート＋停止候補）</title>
+<title>ルート録音ツール（実走ルート＋停止候補）</title>
 
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="anonymous">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin="anonymous"></script>
@@ -482,16 +482,29 @@ function saveCSV(){
 }
 
 // ---- イベント ----
-$('#btnStart').addEventListener('click', start);
-$('#btnPause').addEventListener('click', pause);
-$('#btnStop').addEventListener('click', stop);
-$('#btnWake').addEventListener('click', toggleWakeLock);
-$('#btnClear').addEventListener('click', clearAll);
-$('#saveGeoJSON').addEventListener('click', saveGeoJSON);
-$('#saveGPX').addEventListener('click', saveGPX);
-$('#saveCSV').addEventListener('click', saveCSV);
-$('#saveGeoJSONWithStops').addEventListener('click', saveGeoJSONWithStops);
-updateStats(0, null);
+document.addEventListener('DOMContentLoaded', () => {
+  const requiredIds = [
+    'btnStart','btnPause','btnStop','btnWake','btnClear',
+    'saveGeoJSON','saveGPX','saveCSV','saveGeoJSONWithStops'
+  ];
+  const missing = requiredIds.filter(id => !$(id));
+  if (missing.length) {
+    console.error('Required elements missing:', missing);
+    setStatus('初期化エラー: ' + missing.join(', ') + ' が見つかりません', true);
+    return;
+  }
+
+  $('#btnStart').addEventListener('click', start);
+  $('#btnPause').addEventListener('click', pause);
+  $('#btnStop').addEventListener('click', stop);
+  $('#btnWake').addEventListener('click', toggleWakeLock);
+  $('#btnClear').addEventListener('click', clearAll);
+  $('#saveGeoJSON').addEventListener('click', saveGeoJSON);
+  $('#saveGPX').addEventListener('click', saveGPX);
+  $('#saveCSV').addEventListener('click', saveCSV);
+  $('#saveGeoJSONWithStops').addEventListener('click', saveGeoJSONWithStops);
+  updateStats(0, null);
+});
 </script>
 </body>
 </html>
